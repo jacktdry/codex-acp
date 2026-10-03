@@ -1155,6 +1155,7 @@ export class CodexAcpServer {
             this.endSessionCloseFence(params.sessionId);
         }
 
+        await this.recycleAppServerIfIdle();
         return {};
     }
 
@@ -1337,6 +1338,44 @@ export class CodexAcpServer {
             await update;
         } finally {
             if (this.providerUpdate === update) {
+                this.providerUpdate = null;
+            }
+        }
+    }
+
+    /**
+     * Codex currently keeps an unsubscribed thread loaded for a grace period,
+     * including any stdio MCP children attached to that thread. When ACP no
+     * longer owns any live sessions, recycle its dedicated app-server process
+     * so those resources are released immediately.
+     *
+     * Reuse providerUpdate as the process-replacement fence: newSession already
+     * waits on it, so a concurrent session cannot race a child replacement.
+     */
+    private async recycleAppServerIfIdle(): Promise<void> {
+        if (this.sessions.size !== 0 || this.codexProcessState === null || this.initializeRequest === null) {
+            return;
+        }
+
+        const previous = this.providerUpdate?.catch(() => undefined) ?? Promise.resolve();
+        const recycle = previous.then(async () => {
+            if (this.sessions.size !== 0 || this.codexProcessState === null || this.initializeRequest === null) {
+                return;
+            }
+
+            logger.log("Recycling idle Codex app-server after last ACP session closed");
+            const replacement = await this.restartCodexClient();
+            replacement.inheritRuntimeRoutingFrom(this.codexAcpClient);
+            await replacement.initialize(this.initializeRequest);
+            this.codexAcpClient = replacement;
+            this.availableCommands = this.createAvailableCommands(replacement);
+        });
+
+        this.providerUpdate = recycle;
+        try {
+            await recycle;
+        } finally {
+            if (this.providerUpdate === recycle) {
                 this.providerUpdate = null;
             }
         }

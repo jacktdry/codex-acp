@@ -1,4 +1,5 @@
 import {describe, expect, it, vi} from "vitest";
+import {EventEmitter} from "node:events";
 import {
     createCodexMockTestFixture,
     createTestModel,
@@ -60,6 +61,59 @@ describe("ACP session close", () => {
 
         await expect(fixture.getCodexConnectionDump([])).toMatchFileSnapshot("data/session-close-active-turn.json");
         expect(() => codexAcpAgent.getSessionState(sessionId)).toThrow(`Session ${sessionId} not found`);
+    });
+
+    it("recycles the dedicated app-server only after the last ACP session closes", async () => {
+        const replacement = createCodexMockTestFixture().getCodexAcpClient();
+        const replacementInitialize = vi.spyOn(replacement, "initialize").mockResolvedValue();
+        const restart = vi.fn().mockResolvedValue(replacement);
+        const fixture = createCodexMockTestFixture(restart, createMockCodexProcess());
+        const codexAcpAgent = fixture.getCodexAcpAgent();
+        const codexAcpClient = fixture.getCodexAcpClient();
+
+        vi.spyOn(codexAcpClient, "initialize").mockResolvedValue();
+        await codexAcpAgent.initialize({protocolVersion: 1});
+
+        await createSession({fixture});
+        vi.spyOn(codexAcpClient, "newSession").mockResolvedValueOnce({
+            ...createSessionMetadata(),
+            sessionId: "session-2",
+        });
+        await codexAcpAgent.newSession({cwd: "/test/cwd", mcpServers: []});
+
+        await codexAcpAgent.closeSession({sessionId});
+        expect(restart).not.toHaveBeenCalled();
+
+        await codexAcpAgent.closeSession({sessionId: "session-2"});
+        expect(restart).toHaveBeenCalledOnce();
+        expect(replacementInitialize).toHaveBeenCalledWith({protocolVersion: 1});
+    });
+
+    it("preserves runtime gateway routing across the idle app-server recycle", async () => {
+        const replacement = createCodexMockTestFixture().getCodexAcpClient();
+        vi.spyOn(replacement, "initialize").mockResolvedValue();
+        const restart = vi.fn().mockResolvedValue(replacement);
+        const fixture = createCodexMockTestFixture(restart, createMockCodexProcess());
+        const codexAcpAgent = fixture.getCodexAcpAgent();
+        const codexAcpClient = fixture.getCodexAcpClient();
+
+        vi.spyOn(codexAcpClient, "initialize").mockResolvedValue();
+        await codexAcpAgent.initialize({protocolVersion: 1});
+        await createSession({fixture});
+
+        codexAcpClient.setProvider({
+            providerId: "openai",
+            apiType: "openai",
+            baseUrl: "https://gateway.example/v1",
+            headers: {Authorization: "Bearer secret"},
+        });
+
+        await codexAcpAgent.closeSession({sessionId});
+
+        expect(replacement.listProviders()[0]?.current).toEqual({
+            apiType: "openai",
+            baseUrl: "https://gateway.example/v1",
+        });
     });
 
     it("does not publish available commands after close completes", async () => {
@@ -522,6 +576,7 @@ describe("ACP session close", () => {
 });
 
 async function createSession(options: {
+    fixture?: CodexMockTestFixture,
     mcpServers?: McpServer[],
     configure?: (params: {
         fixture: CodexMockTestFixture,
@@ -533,7 +588,7 @@ async function createSession(options: {
     codexAcpAgent: CodexAcpServer,
     codexAcpClient: CodexAcpClient,
 }> {
-    const fixture = createCodexMockTestFixture();
+    const fixture = options.fixture ?? createCodexMockTestFixture();
     const codexAcpAgent = fixture.getCodexAcpAgent();
     const codexAcpClient = fixture.getCodexAcpClient();
     const model = createTestModel();
@@ -596,6 +651,16 @@ function createSessionMetadata(): SessionMetadata {
         currentServiceTier: null,
         additionalDirectories: [],
     };
+}
+
+
+function createMockCodexProcess() {
+    return Object.assign(new EventEmitter(), {
+        stderr: new EventEmitter(),
+        stdin: {end: vi.fn()},
+        exitCode: null,
+        killed: false,
+    }) as never;
 }
 
 async function waitForMicrotasks(): Promise<void> {

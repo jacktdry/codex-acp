@@ -467,6 +467,28 @@ export class CodexAcpClient {
         ];
     }
 
+    /**
+     * Preserve runtime-only provider routing across an app-server recycle.
+     *
+     * The Codex app-server process owns loaded thread/MCP runtime state, while
+     * gateway routing lives on this ACP client instance. Replacing the child
+     * process must not silently reset a provider selected through authenticate
+     * or providers/set.
+     */
+    inheritRuntimeRoutingFrom(source: CodexAcpClient): void {
+        const gatewayConfig = source.gatewayConfig;
+        this.gatewayConfig = gatewayConfig
+            ? {
+                modelProvider: gatewayConfig.modelProvider,
+                config: {
+                    ...gatewayConfig.config,
+                    http_headers: {...gatewayConfig.config.http_headers},
+                },
+            }
+            : null;
+        this.gatewayConfigSource = source.gatewayConfigSource;
+    }
+
     private getNativeProviderConfig(): acp.ProviderCurrentConfig {
         const configuredProviderId = this.modelProvider ??
             (typeof this.config["model_provider"] === "string" ? this.config["model_provider"] : null);
